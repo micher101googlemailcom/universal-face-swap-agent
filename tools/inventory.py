@@ -81,7 +81,11 @@ def version_hint(root):
 
 def scan(root, label, modules, provenance):
     assets = []
-    for current, dirs, files in os.walk(root, followlinks=False):
+
+    def traversal_error(exc):
+        raise exc
+
+    for current, dirs, files in os.walk(root, followlinks=False, onerror=traversal_error):
         dirs[:] = sorted(d for d in dirs if not (Path(current) / d).is_symlink())
         for filename in sorted(files):
             path = Path(current) / filename
@@ -166,6 +170,10 @@ def main(argv=None):
                any(not isinstance(value, str) or len(value) > 200 or "/" in value or "\\" in value or ":" in value
                    for value in v.values()) for v in provenance.values()):
             parser.error("provenance permits only sanitized source, license, note strings without path separators or colons")
+        normalized = {key.lower(): value for key, value in provenance.items()}
+        if len(normalized) != len(provenance):
+            parser.error("--provenance contains duplicate SHA-256 keys differing only in case")
+        provenance = normalized
     modules = {}
     dependencies = {}
     for name in ("onnx", "safetensors", "onnxruntime"):
@@ -181,7 +189,11 @@ def main(argv=None):
             "dependencies": dependencies, "providers": providers,
             "visomaster": version_hint(vm) if vm else None, "assets": []}
     for index, root in enumerate(roots, 1):
-        data["assets"].extend(scan(root, f"root-{index}", modules, provenance))
+        label = f"root-{index}"
+        try:
+            data["assets"].extend(scan(root, label, modules, provenance))
+        except OSError as exc:
+            parser.error(f"{label}: directory traversal failed ({type(exc).__name__}); inventory not written")
     destination.mkdir(parents=True, exist_ok=True)
     (destination / "inventory.json").write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     (destination / "inventory.md").write_text(report(data), encoding="utf-8")

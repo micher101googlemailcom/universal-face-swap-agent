@@ -17,6 +17,8 @@ python -m pip install onnx safetensors onnxruntime-gpu
 
 `onnx` reads input/output names, element types, symbolic/static shapes, opsets and external-data presence without loading external weight files. `safetensors` reads keys, dtypes and shapes through slice metadata without materializing tensors. `onnxruntime` reports locally available execution providers; this is only a provider listing, not proof of working CUDA/TensorRT inference. Engine filename hints are not evidence of compatibility. Missing libraries and per-file parse failures are recorded and scanning continues. ONNX models with external weights have an incomplete hash chain until their referenced files are inventoried separately; external files are not traversed automatically.
 
+If a selected root or nested directory cannot be enumerated, the command exits with code 2 before writing either report. The error identifies only the scan-root label and exception type, never the directory path or raw exception message. An incomplete traversal is not published as a successful inventory.
+
 For known provenance, provide a local JSON file keyed by the **full** SHA-256, with only short sanitized `source`, `license`, and `note` strings. Example:
 
 ```json
@@ -24,3 +26,7 @@ For known provenance, provide a local JSON file keyed by the **full** SHA-256, w
 ```
 
 Pass it using `--provenance C:\private\provenance.json`. Unknown entries remain `{"status":"unknown"}`. Only the existence of a standard `version.txt`, `VERSION`, or Git HEAD in `--visomaster` is inspected; if none is present, version remains unknown. A Git revision is not necessarily a release version. Manually review the reported version and asset contracts before selecting the baseline pair or mapping pose bins.
+
+Provenance hash keys accept uppercase, lowercase, or mixed-case hexadecimal and are normalized to lowercase after validation. Keys that differ only in case are rejected to prevent silent overwrites; the existing provenance sanitization rules still apply.
+
+Run the regression tests from the repository root with `python -m unittest discover -s tests -v`. They use only the standard library, temporary synthetic files and simulated filesystem errors; no models, optional packages or network access are required.
