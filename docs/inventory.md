@@ -1,6 +1,6 @@
 # Experiment 1: local model inventory
 
-Run with Python 3.10+ on the machine containing your models. No network client is used. The tool reads only selected directories and optional local metadata; it neither starts inference nor deserializes TensorRT engines. It follows no symlinked files/directories. Output is refused inside or above a scanned directory or the VisoMaster directory; existing output files are never overwritten.
+Run with Python 3.10+ on the machine containing your models. No network client is used. The tool reads only selected directories and optional local metadata; it neither starts inference nor deserializes TensorRT engines. Beneath each resolved scan root, symlinked files/directories and all Windows reparse points (including NTFS junctions and mount points) are excluded. Output is refused inside or above a scanned directory or the VisoMaster directory; existing output files are never overwritten.
 
 ```powershell
 # Windows PowerShell 5.1; adjust paths to existing directories on your PC.
@@ -17,7 +17,9 @@ python -m pip install onnx safetensors onnxruntime-gpu
 
 `onnx` reads input/output names, element types, symbolic/static shapes, opsets and external-data presence without loading external weight files. `safetensors` reads keys, dtypes and shapes through slice metadata without materializing tensors. `onnxruntime` reports locally available execution providers; this is only a provider listing, not proof of working CUDA/TensorRT inference. Engine filename hints are not evidence of compatibility. Missing libraries and per-file parse failures are recorded and scanning continues. ONNX models with external weights have an incomplete hash chain until their referenced files are inventoried separately; external files are not traversed automatically.
 
-If a selected root or nested directory cannot be enumerated, the command exits with code 2 before writing either report. The error identifies only the scan-root label and exception type, never the directory path or raw exception message. An incomplete traversal is not published as a successful inventory.
+If a selected root or nested directory cannot be enumerated, or an entry cannot be classified with a non-following stat call, the command exits with code 2 before writing either report. This includes entries disappearing during classification. The error identifies only the scan-root label and exception type, never the directory path or raw exception message. An incomplete traversal is not published as a successful inventory.
+
+Both report names are checked without following links, so dangling output symlinks are also rejected. Both files are then opened for exclusive creation before any inventory data is written, preventing overwrites or following links that appear after the check. An output failure exits with code 2 and may leave empty or incomplete report files; use a fresh output directory after correcting the cause. Existing entries are never deleted as cleanup.
 
 For known provenance, provide a local JSON file keyed by the **full** SHA-256, with only short sanitized `source`, `license`, and `note` strings. Example:
 
@@ -29,4 +31,4 @@ Pass it using `--provenance C:\private\provenance.json`. Unknown entries remain 
 
 Provenance hash keys accept uppercase, lowercase, or mixed-case hexadecimal and are normalized to lowercase after validation. Keys that differ only in case are rejected to prevent silent overwrites; the existing provenance sanitization rules still apply.
 
-Run the regression tests from the repository root with `python -m unittest discover -s tests -v`. They use only the standard library, temporary synthetic files and simulated filesystem errors; no models, optional packages or network access are required.
+Run the regression tests from the repository root with `python -m unittest discover -s tests -v`. They use only the standard library, temporary synthetic files and simulated filesystem errors; no models, optional packages or network access are required. Reparse-point filtering is tested on all platforms; an additional native junction/cycle test runs only on Windows. Symlink tests require permission to create symlinks and report a skip if that capability is unavailable.

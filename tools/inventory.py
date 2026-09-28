@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 
 
 EXTENSIONS = {".onnx": "onnx", ".safetensors": "safetensors", ".engine": "tensorrt_engine", ".plan": "tensorrt_engine"}
@@ -79,22 +80,48 @@ def version_hint(root):
     return {"version": None, "status": "not found in version.txt, VERSION or git HEAD"}
 
 
+def is_link_or_reparse(info):
+    return stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def walk_directory_files(root):
+    """Yield directories and regular filenames, propagating all traversal errors."""
+    pending = [root]
+    while pending:
+        current = pending.pop()
+        # Recheck queued directories without following Windows junctions, too.
+        if is_link_or_reparse(current.lstat()):
+            raise OSError("scan directory became a link or reparse point")
+        directories, files = [], []
+        with os.scandir(current) as entries:
+            for entry in sorted(entries, key=lambda item: item.name):
+                # Unlike os.walk/is_dir, stat does not hide classification errors
+                # (including FileNotFoundError). No report is published on failure.
+                info = entry.stat(follow_symlinks=False)
+                if is_link_or_reparse(info):
+                    continue
+                if stat.S_ISDIR(info.st_mode):
+                    directories.append(current / entry.name)
+                elif stat.S_ISREG(info.st_mode):
+                    files.append(entry.name)
+        yield current, files
+        pending.extend(reversed(directories))
+
+
 def scan(root, label, modules, provenance):
     assets = []
-
-    def traversal_error(exc):
-        raise exc
-
-    for current, dirs, files in os.walk(root, followlinks=False, onerror=traversal_error):
-        dirs[:] = sorted(d for d in dirs if not (Path(current) / d).is_symlink())
-        for filename in sorted(files):
-            path = Path(current) / filename
+    for current, files in walk_directory_files(root):
+        for filename in files:
+            path = current / filename
             kind = EXTENSIONS.get(path.suffix.lower())
-            if kind is None or path.is_symlink():
+            if kind is None:
                 continue
             entry = {"id": None, "scan_root": label, "type": kind}
             try:
-                before = path.stat()
+                before = path.lstat()
+                if is_link_or_reparse(before):
+                    continue
                 entry.update({"sha256": digest(path), "size_bytes": before.st_size})
                 after = path.stat()
                 if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
@@ -158,8 +185,16 @@ def main(argv=None):
         vm = None
     if vm and (destination == vm or vm in destination.parents or destination in vm.parents):
         parser.error("--output must be disjoint from VisoMaster directory")
-    if any((destination / name).exists() for name in ("inventory.json", "inventory.md")):
-        parser.error("output files already exist; use a fresh output directory")
+    output_json, output_md = destination / "inventory.json", destination / "inventory.md"
+    for path in (output_json, output_md):
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            parser.error(f"output check failed ({type(exc).__name__})")
+        else:
+            parser.error("output files already exist; use a fresh output directory")
     provenance = {}
     if args.provenance:
         with args.provenance.open(encoding="utf-8") as stream:
@@ -194,9 +229,18 @@ def main(argv=None):
             data["assets"].extend(scan(root, label, modules, provenance))
         except OSError as exc:
             parser.error(f"{label}: directory traversal failed ({type(exc).__name__}); inventory not written")
-    destination.mkdir(parents=True, exist_ok=True)
-    (destination / "inventory.json").write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    (destination / "inventory.md").write_text(report(data), encoding="utf-8")
+    json_text = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    markdown_text = report(data)
+    try:
+        destination.mkdir(parents=True, exist_ok=True)
+        # Reserve both names exclusively before writing any inventory data.
+        # This also rejects links/files created after the preflight check.
+        with output_json.open("x", encoding="utf-8") as json_stream, \
+                output_md.open("x", encoding="utf-8") as markdown_stream:
+            json_stream.write(json_text)
+            markdown_stream.write(markdown_text)
+    except OSError as exc:
+        parser.error(f"output write failed ({type(exc).__name__}); use a fresh output directory")
     print(f"Inventoried {len(data['assets'])} files in {destination}")
 
 
