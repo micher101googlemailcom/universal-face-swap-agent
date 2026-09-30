@@ -30,4 +30,8 @@ jobs:
       - name: Compile Python
         run: python -m compileall -q tools tests
       - name: Run inventory regression tests
+        # Avoid Windows 8.3 temp aliases breaking path-based filesystem mocks.
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
         run: python -m unittest discover -s tests -p "test_inventory.py" -v
