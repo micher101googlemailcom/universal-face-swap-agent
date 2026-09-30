@@ -164,6 +164,39 @@ def report(data):
     return "\n".join(lines)
 
 
+def create_output(path):
+    """Reserve a report name without following a late Windows symlink."""
+    if os.name != "nt":
+        return path.open("x", encoding="utf-8")
+
+    # On Windows, the CRT's exclusive open can create the target of a dangling
+    # symlink. CREATE_NEW plus OPEN_REPARSE_POINT checks the directory entry.
+    import ctypes
+    from ctypes import wintypes
+    import msvcrt
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                            wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(str(path), 0x40000000, 0, None, 1, 0x00200080, None)
+    if handle == wintypes.HANDLE(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        fd = msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY)
+    except Exception:
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle(handle)
+        raise
+    try:
+        return os.fdopen(fd, "w", encoding="utf-8")
+    except Exception:
+        os.close(fd)
+        raise
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scan", type=Path, action="append", required=True, help="Explicit model directory; repeatable")
@@ -235,8 +268,8 @@ def main(argv=None):
         destination.mkdir(parents=True, exist_ok=True)
         # Reserve both names exclusively before writing any inventory data.
         # This also rejects links/files created after the preflight check.
-        with output_json.open("x", encoding="utf-8") as json_stream, \
-                output_md.open("x", encoding="utf-8") as markdown_stream:
+        with create_output(output_json) as json_stream, \
+                create_output(output_md) as markdown_stream:
             json_stream.write(json_text)
             markdown_stream.write(markdown_text)
     except OSError as exc:

@@ -258,6 +258,8 @@ class InventoryTests(unittest.TestCase):
                         self.output.mkdir()
                         if kind == "dangling-symlink":
                             self.make_symlink(path, target)
+                            self.assertTrue(path.is_symlink())
+                            self.assertFalse(target.exists())
                         else:
                             path.write_bytes(b"concurrent writer")
                         return assets
