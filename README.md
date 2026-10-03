@@ -4,6 +4,8 @@ Research, workflow and quality documentation for an **offline, single-machine** 
 
 Start with [workflow](docs/workflow.md), [evidence register](docs/evidence.md), [quality gates](docs/quality-gates.md), [troubleshooting](docs/troubleshooting.md), and [next experiments](docs/experiments.md).
 
+Experiment 1 has a [local read-only inventory tool](docs/inventory.md). It records metadata only for explicitly selected model directories and produces JSON and Markdown for private review.
+
 ## Boundaries
 
 - Keep original footage, reference images, model weights and private face embeddings off the public repository. Record hashes and sanitized metadata instead.
