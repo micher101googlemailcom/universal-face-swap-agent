@@ -696,6 +696,113 @@ class InventoryTests(unittest.TestCase):
                                                onnx)["external_data_present"])
 
 
+    def test_metadata_changes_are_checked_after_extraction(self):
+        for kind, function in (("onnx", "onnx_details"), ("safetensors", "safetensors_details")):
+            for failed in (False, True):
+                with self.subTest(kind=kind, parser_fails=failed):
+                    source = self.root / ("changing." + kind)
+                    source.write_bytes(b"old contents")
+                    real_fstat = os.fstat
+                    changed = False
+
+                    def metadata(stream, module):
+                        nonlocal changed
+                        changed = True
+                        if failed:
+                            raise ValueError("private parser detail")
+                        return {"tensors": []}
+
+                    def fstat(fd):
+                        info = real_fstat(fd)
+                        if changed and os.path.samestat(info, source.stat()):
+                            return SimpleNamespace(st_dev=info.st_dev, st_ino=info.st_ino,
+                                                   st_size=info.st_size + 1,
+                                                   st_mtime_ns=info.st_mtime_ns + 1,
+                                                   st_ctime_ns=info.st_ctime_ns + 1)
+                        return info
+
+                    modules = {"onnx": None, "safetensors": None}
+                    modules[kind] = object()
+                    with patch.object(inventory, function, side_effect=metadata), \
+                            patch.object(inventory.os, "fstat", side_effect=fstat):
+                        assets = inventory.scan(self.root, "root-1", modules, {})
+                    asset = next(a for a in assets if a["type"] == kind)
+                    self.assertIn("source changed", asset.get("warning", ""))
+                    self.assertEqual("metadata_error" in asset, failed)
+                    source.unlink()
+
+    @unittest.skipIf(os.name == "nt", "Windows denies concurrent writes through sharing locks")
+    def test_real_in_place_write_during_metadata_is_warned(self):
+        source = self.root / "changing.onnx"
+        source.write_bytes(b"old model")
+        old_hash = hashlib.sha256(b"old model").hexdigest()
+        def metadata(stream, module):
+            source.write_bytes(b"new and longer model")
+            stream.seek(0)
+            return {"payload": stream.read().decode()}
+        with patch.object(inventory, "onnx_details", side_effect=metadata):
+            assets = inventory.scan(self.root, "root-1", {"onnx": object(), "safetensors": None}, {})
+        asset = next(a for a in assets if a["type"] == "onnx")
+        self.assertEqual(asset["sha256"], old_hash)
+        self.assertEqual(asset["onnx"]["payload"], "new and longer model")
+        self.assertIn("source changed", asset.get("warning", ""))
+
+    def test_malformed_git_ref_components_return_unknown_without_aborting(self):
+        vm = self.base / "visomaster"
+        git = vm / ".git"
+        (git / "refs" / "heads").mkdir(parents=True)
+        for i, ref in enumerate(("refs//main", "refs/./main", "refs/heads/", "refs/../main")):
+            with self.subTest(ref=ref):
+                self.output = self.base / ("malformed-ref-output-" + str(i))
+                (git / "HEAD").write_text("ref: " + ref, encoding="ascii")
+                self.run_inventory("--visomaster", str(vm))
+                data = json.loads((self.output / "inventory.json").read_text(encoding="utf-8"))
+                self.assertIsNone(data["visomaster"]["version"])
+                self.assertNotIn("revision", data["visomaster"])
+                self.assertEqual(data["assets"][0]["sha256"], self.sha256)
+
+    def test_onnx_non_tensor_contracts_report_explicit_metadata_error(self):
+        try:
+            import onnx
+        except ImportError:
+            if os.environ.get("INVENTORY_REQUIRE_ONNX") == "1":
+                self.fail("ONNX is required in CI")
+            self.skipTest("optional ONNX package unavailable")
+        source = self.root / "contract.onnx"
+        for side in ("input", "output"):
+            for kind in ("sequence_type", "map_type", "optional_type", "sparse_tensor_type"):
+                with self.subTest(side=side, kind=kind):
+                    model = onnx.ModelProto()
+                    value = getattr(model.graph, side).add()
+                    value.name = "contract"
+                    if kind == "map_type":
+                        value.type.map_type.key_type = onnx.TensorProto.INT64
+                        value.type.map_type.value_type.tensor_type.elem_type = onnx.TensorProto.FLOAT
+                    elif kind == "sparse_tensor_type":
+                        value.type.sparse_tensor_type.elem_type = onnx.TensorProto.FLOAT
+                    else:
+                        getattr(value.type, kind).elem_type.tensor_type.elem_type = onnx.TensorProto.FLOAT
+                    source.write_bytes(model.SerializeToString())
+                    assets = inventory.scan(self.root, "root-1", {"onnx": onnx, "safetensors": None}, {})
+                    asset = next(a for a in assets if a["type"] == "onnx")
+                    self.assertEqual(asset.get("metadata_error"), "UnsupportedONNXTypeError")
+                    self.assertNotIn("onnx", asset)
+                    self.assertEqual(asset["sha256"], hashlib.sha256(source.read_bytes()).hexdigest())
+        model = onnx.ModelProto()
+        value = model.graph.input.add()
+        value.name = "tensor"
+        value.type.tensor_type.elem_type = onnx.TensorProto.FLOAT
+        value.type.tensor_type.shape.dim.add().dim_param = "batch"
+        value.type.tensor_type.shape.dim.add().dim_value = 3
+        result = inventory.onnx_details(io.BytesIO(model.SerializeToString()), onnx)
+        self.assertEqual(result["inputs"], [{"name": "tensor", "dtype": "FLOAT", "shape": ["batch", 3]}])
+        source.write_bytes(model.SerializeToString())
+        assets = inventory.scan(self.root, "root-1", {"onnx": onnx, "safetensors": None}, {})
+        asset = next(a for a in assets if a["type"] == "onnx")
+        self.assertNotIn("metadata_error", asset)
+        self.assertNotIn("warning", asset)
+        self.assertEqual(asset["onnx"], result)
+
+
 if __name__ == "__main__":
     unittest.main()
-

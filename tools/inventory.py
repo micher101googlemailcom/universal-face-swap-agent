@@ -48,12 +48,19 @@ def external_tensors(message, module):
     return False
 
 
+class UnsupportedONNXTypeError(ValueError):
+    """The report schema only represents dense tensor interface contracts."""
+
+
 def onnx_details(stream, module):
     stream.seek(0)
-    model = module.load(stream, load_external_data=False)
+    # fdopen streams have an integer name; do not let ONNX infer a path/format.
+    model = module.load(stream, format="protobuf", load_external_data=False)
     def signature(values):
         result = []
         for value in values:
+            if value.type.WhichOneof("value") != "tensor_type":
+                raise UnsupportedONNXTypeError("unsupported ONNX interface type")
             tensor = value.type.tensor_type
             shape = [dim.dim_param if dim.dim_param else dim.dim_value if dim.HasField("dim_value") else None
                      for dim in tensor.shape.dim] if tensor.HasField("shape") else None
@@ -125,13 +132,15 @@ def version_hint(root):
                     head = stream.read(512).decode("ascii").strip()
                 if head.startswith("ref: "):
                     ref = head[5:]
-                    if re.fullmatch(r"refs/[A-Za-z0-9/_.-]+", ref) and ".." not in ref:
+                    parts = ref.split("/")
+                    if (re.fullmatch(r"refs/[A-Za-z0-9/_.-]+", ref) and ".." not in ref
+                            and all(part not in ("", ".", "..") for part in parts)):
                         try:
                             with ExitStack() as stack:
                                 parent = git
-                                for part in ref.split("/")[:-1]:
+                                for part in parts[:-1]:
                                     parent = stack.enter_context(parent.child(part))
-                                with parent.file(ref.split("/")[-1]) as stream:
+                                with parent.file(parts[-1]) as stream:
                                     head = stream.read(128).decode("ascii").strip()
                         except FileNotFoundError:
                             with git.file("packed-refs") as stream:
@@ -182,9 +191,6 @@ def scan(root, label, modules, provenance):
                 with current.file(filename) as stream:
                     before = os.fstat(stream.fileno())
                     entry.update({"sha256": digest(stream), "size_bytes": before.st_size})
-                    after = os.fstat(stream.fileno())
-                    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
-                        entry["warning"] = "source changed during scan; hash may be inconsistent"
                     entry["id"] = kind + ":" + entry["sha256"][:16]
                     entry["provenance"] = provenance.get(entry["sha256"], {"status": "unknown"})
                     if kind == "onnx" and modules["onnx"]:
@@ -201,6 +207,10 @@ def scan(root, label, modules, provenance):
                         entry["engine_hints"] = {"sm120_in_filename": "_sm120" in filename.lower(),
                                                  "verified_compatible": False,
                                                  "note": "Opaque engine; no deserialization or inference performed"}
+                    after = os.fstat(stream.fileno())
+                    fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+                    if any(getattr(before, field) != getattr(after, field) for field in fields):
+                        entry["warning"] = "source changed during scan; hash, metadata and provenance may be inconsistent"
             except OSError as exc:
                 entry["error"] = type(exc).__name__
             assets.append(entry)
@@ -325,4 +335,3 @@ def run(argv, stack):
 
 if __name__ == "__main__":
     main()
-

@@ -35,3 +35,5 @@ Run the regression tests from the repository root with `python -m unittest disco
 
 
 Directory traversal and report creation stay anchored to open directories: POSIX uses descriptor-relative no-follow operations; Windows pins every ancestor with no-follow handles that deny write/delete sharing. Late links are rejected. A renamed POSIX output directory can receive reports through its original pinned handle, but replacement links are never followed. Windows sharing conflicts fail closed. Hashing and optional metadata use one verified regular-file stream. Git metadata components, including `.git`, `HEAD` and refs, use the same no-follow access.
+
+The final source-change check runs after hashing and all metadata reads, including failed metadata extraction. Detected identity, size or timestamp changes add a warning that the hash, metadata and provenance may be inconsistent. This check is not an atomic filesystem snapshot. Malformed Git ref components leave the optional version hint unknown instead of aborting the inventory. ONNX interface contracts other than dense tensors produce `UnsupportedONNXTypeError`; their types are not misrepresented as `UNDEFINED` tensors.
