@@ -1,6 +1,8 @@
 """Offline, read-only inventory of explicitly selected model directories."""
 
 import argparse
+from contextlib import ExitStack
+import struct
 import hashlib
 import importlib
 import json
@@ -8,6 +10,11 @@ import os
 from pathlib import Path
 import re
 import stat
+
+if __package__:
+    from . import secure_io
+else:
+    import secure_io
 
 
 EXTENSIONS = {".onnx": "onnx", ".safetensors": "safetensors", ".engine": "tensorrt_engine", ".plan": "tensorrt_engine"}
@@ -20,16 +27,30 @@ def optional(name):
         return None, type(exc).__name__
 
 
-def digest(path):
+def digest(stream):
     h = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            h.update(block)
+    stream.seek(0)
+    for block in iter(lambda: stream.read(1024 * 1024), b""):
+        h.update(block)
     return h.hexdigest()
 
 
-def onnx_details(path, module):
-    model = module.load(str(path), load_external_data=False)
+def external_tensors(message, module):
+    """Walk protobuf message fields, including subgraphs, sparse tensors/functions."""
+    if isinstance(message, module.TensorProto):
+        return message.data_location == module.TensorProto.EXTERNAL or bool(message.external_data)
+    for field, value in message.ListFields():
+        if field.type == field.TYPE_MESSAGE:
+            repeated = field.is_repeated if hasattr(field, "is_repeated") else field.label == field.LABEL_REPEATED
+            values = value if repeated else (value,)
+            if any(external_tensors(child, module) for child in values):
+                return True
+    return False
+
+
+def onnx_details(stream, module):
+    stream.seek(0)
+    model = module.load(stream, load_external_data=False)
     def signature(values):
         result = []
         for value in values:
@@ -39,109 +60,147 @@ def onnx_details(path, module):
             result.append({"name": value.name, "dtype": module.TensorProto.DataType.Name(tensor.elem_type), "shape": shape})
         return result
     return {"inputs": signature(model.graph.input), "outputs": signature(model.graph.output),
-            "external_data_present": any(t.data_location == module.TensorProto.EXTERNAL for t in model.graph.initializer),
+            "external_data_present": external_tensors(model, module),
             "opset": [{"domain": o.domain, "version": o.version} for o in model.opset_import]}
 
 
-def safetensors_details(path, module):
-    with module.safe_open(str(path), framework="np", device="cpu") as handle:
-        return {"tensors": [{"key": key, "dtype": handle.get_slice(key).get_dtype(),
-                              "shape": list(handle.get_slice(key).get_shape())} for key in handle.keys()]}
+def safetensors_details(stream, module):
+    # safe_open only accepts paths. Read the bounded JSON header from the same
+    # verified stream instead of reopening a mutable path or loading GPU tensors.
+    stream.seek(0)
+    length = struct.unpack("<Q", stream.read(8))[0]
+    if length > 100_000_000 or length > os.fstat(stream.fileno()).st_size - 8:
+        raise ValueError("invalid safetensors header length")
+    raw = stream.read(length)
+    if not raw.startswith(b"{"):
+        raise ValueError("invalid safetensors header")
+    header = json.loads(raw, object_pairs_hook=unique_object)
+    bits = {"BOOL": 8, "U8": 8, "I8": 8, "I16": 16, "U16": 16, "F16": 16,
+            "BF16": 16, "I32": 32, "U32": 32, "F32": 32, "I64": 64, "U64": 64,
+            "F64": 64, "F8_E4M3": 8, "F8_E5M2": 8, "F8_E8M0": 8}
+    tensors, ranges = [], []
+    for key, value in header.items():
+        if key == "__metadata__":
+            if not isinstance(value, dict) or any(not isinstance(v, str) for v in value.values()):
+                raise ValueError("invalid safetensors metadata")
+            continue
+        dtype, shape, offsets = value["dtype"], value["shape"], value["data_offsets"]
+        if dtype not in bits or not isinstance(shape, list) or any(type(d) is not int or d < 0 for d in shape):
+            raise ValueError("unsupported dtype or invalid shape")
+        if not isinstance(offsets, list) or len(offsets) != 2 or any(type(d) is not int or d < 0 for d in offsets):
+            raise ValueError("invalid offsets")
+        size = bits[dtype]
+        for dim in shape:
+            size *= dim
+        start, end = offsets
+        if size % 8 or end < start or end - start != size // 8:
+            raise ValueError("tensor size does not match offsets")
+        ranges.append((start, end))
+        tensors.append({"key": key, "dtype": dtype, "shape": shape})
+    offset = 0
+    for start, end in sorted(ranges):
+        if start != offset:
+            raise ValueError("overlapping tensors or unindexed data")
+        offset = end
+    if offset != os.fstat(stream.fileno()).st_size - 8 - length:
+        raise ValueError("invalid safetensors data length")
+    return {"tensors": sorted(tensors, key=lambda item: item["key"])}
+
 
 
 def version_hint(root):
-    """Read only conventional local release metadata, never execute application code."""
-    for name in ("version.txt", "VERSION"):
-        candidate = root / name
-        if candidate.is_file() and not candidate.is_symlink():
-            try:
-                value = candidate.read_text(encoding="utf-8")[:128].strip()
-                if re.fullmatch(r"[A-Za-z0-9._+ -]{1,80}", value):
-                    return {"version": value, "source": name}
-            except (OSError, UnicodeError):
-                pass
-    git = root / ".git"
-    if git.is_dir():
-        try:
-            head = (git / "HEAD").read_text(encoding="ascii").strip()
-            if head.startswith("ref: "):
-                ref = head[5:]
-                if re.fullmatch(r"refs/[A-Za-z0-9/_.-]+", ref) and ".." not in ref:
-                    ref_file = git / ref
-                    if ref_file.is_file():
-                        head = ref_file.read_text(encoding="ascii").strip()
-                    else:
-                        packed = (git / "packed-refs").read_text(encoding="ascii")
-                        head = next((line.split(" ")[0] for line in packed.splitlines() if line.endswith(" " + ref)), "")
-            if re.fullmatch(r"[0-9a-fA-F]{40,64}", head):
-                return {"revision": head, "source": "git HEAD", "version": None}
-        except (OSError, UnicodeError):
-            pass
+    """Read conventional metadata through pinned no-follow directory handles."""
+    try:
+        with secure_io.anchor(root) as (directory, _):
+            for name in ("version.txt", "VERSION"):
+                try:
+                    with directory.file(name) as stream:
+                        value = stream.read(512).decode("utf-8")[:128].strip()
+                    if re.fullmatch(r"[A-Za-z0-9._+ -]{1,80}", value):
+                        return {"version": value, "source": name}
+                except (OSError, UnicodeError):
+                    pass
+            with directory.child(".git") as git:
+                with git.file("HEAD") as stream:
+                    head = stream.read(512).decode("ascii").strip()
+                if head.startswith("ref: "):
+                    ref = head[5:]
+                    if re.fullmatch(r"refs/[A-Za-z0-9/_.-]+", ref) and ".." not in ref:
+                        try:
+                            with ExitStack() as stack:
+                                parent = git
+                                for part in ref.split("/")[:-1]:
+                                    parent = stack.enter_context(parent.child(part))
+                                with parent.file(ref.split("/")[-1]) as stream:
+                                    head = stream.read(128).decode("ascii").strip()
+                        except FileNotFoundError:
+                            with git.file("packed-refs") as stream:
+                                head = next((line.decode("ascii").split(" ")[0] for line in stream
+                                             if line.decode("ascii").strip().endswith(" " + ref)), "")
+                if re.fullmatch(r"[0-9a-fA-F]{40,64}", head):
+                    return {"revision": head, "source": "git HEAD", "version": None}
+    except (OSError, UnicodeError):
+        pass
     return {"version": None, "status": "not found in version.txt, VERSION or git HEAD"}
 
 
 def is_link_or_reparse(info):
-    return stat.S_ISLNK(info.st_mode) or bool(
-        getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+    return secure_io.linked(info)
 
 
 def walk_directory_files(root):
-    """Yield directories and regular filenames, propagating all traversal errors."""
-    pending = [root]
-    while pending:
-        current = pending.pop()
-        # Recheck queued directories without following Windows junctions, too.
-        if is_link_or_reparse(current.lstat()):
-            raise OSError("scan directory became a link or reparse point")
+    """Keep parent handles live until enumeration and file reads have finished."""
+    def walk(directory):
         directories, files = [], []
-        with os.scandir(current) as entries:
+        with directory.entries() as entries:
             for entry in sorted(entries, key=lambda item: item.name):
-                # Unlike os.walk/is_dir, stat does not hide classification errors
-                # (including FileNotFoundError). No report is published on failure.
                 info = entry.stat(follow_symlinks=False)
                 if is_link_or_reparse(info):
                     continue
                 if stat.S_ISDIR(info.st_mode):
-                    directories.append(current / entry.name)
+                    directories.append(entry.name)
                 elif stat.S_ISREG(info.st_mode):
                     files.append(entry.name)
-        yield current, files
-        pending.extend(reversed(directories))
+        yield directory, files
+        for name in directories:
+            with directory.child(name) as child:
+                yield from walk(child)
+    with secure_io.anchor(root) as (directory, _):
+        yield from walk(directory)
 
 
 def scan(root, label, modules, provenance):
     assets = []
     for current, files in walk_directory_files(root):
         for filename in files:
-            path = current / filename
+            path = current.path / filename
             kind = EXTENSIONS.get(path.suffix.lower())
             if kind is None:
                 continue
             entry = {"id": None, "scan_root": label, "type": kind}
             try:
-                before = path.lstat()
-                if is_link_or_reparse(before):
-                    continue
-                entry.update({"sha256": digest(path), "size_bytes": before.st_size})
-                after = path.stat()
-                if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
-                    entry["warning"] = "source changed during scan; hash may be inconsistent"
-                entry["id"] = kind + ":" + entry["sha256"][:16]
-                entry["provenance"] = provenance.get(entry["sha256"], {"status": "unknown"})
-                if kind == "onnx" and modules["onnx"]:
-                    try:
-                        entry["onnx"] = onnx_details(path, modules["onnx"])
-                    except Exception as exc:
-                        entry["metadata_error"] = type(exc).__name__
-                elif kind == "safetensors" and modules["safetensors"]:
-                    try:
-                        entry["safetensors"] = safetensors_details(path, modules["safetensors"])
-                    except Exception as exc:
-                        entry["metadata_error"] = type(exc).__name__
-                elif kind == "tensorrt_engine":
-                    entry["engine_hints"] = {"sm120_in_filename": "_sm120" in filename.lower(),
-                                             "verified_compatible": False,
-                                             "note": "Opaque engine; no deserialization or inference performed"}
+                with current.file(filename) as stream:
+                    before = os.fstat(stream.fileno())
+                    entry.update({"sha256": digest(stream), "size_bytes": before.st_size})
+                    after = os.fstat(stream.fileno())
+                    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                        entry["warning"] = "source changed during scan; hash may be inconsistent"
+                    entry["id"] = kind + ":" + entry["sha256"][:16]
+                    entry["provenance"] = provenance.get(entry["sha256"], {"status": "unknown"})
+                    if kind == "onnx" and modules["onnx"]:
+                        try:
+                            entry["onnx"] = onnx_details(stream, modules["onnx"])
+                        except Exception as exc:
+                            entry["metadata_error"] = type(exc).__name__
+                    elif kind == "safetensors" and modules["safetensors"]:
+                        try:
+                            entry["safetensors"] = safetensors_details(stream, modules["safetensors"])
+                        except Exception as exc:
+                            entry["metadata_error"] = type(exc).__name__
+                    elif kind == "tensorrt_engine":
+                        entry["engine_hints"] = {"sm120_in_filename": "_sm120" in filename.lower(),
+                                                 "verified_compatible": False,
+                                                 "note": "Opaque engine; no deserialization or inference performed"}
             except OSError as exc:
                 entry["error"] = type(exc).__name__
             assets.append(entry)
@@ -164,40 +223,21 @@ def report(data):
     return "\n".join(lines)
 
 
-def create_output(path):
-    """Reserve a report name without following a late Windows symlink."""
-    if os.name != "nt":
-        return path.open("x", encoding="utf-8")
-
-    # On Windows, the CRT's exclusive open can create the target of a dangling
-    # symlink. CREATE_NEW plus OPEN_REPARSE_POINT checks the directory entry.
-    import ctypes
-    from ctypes import wintypes
-    import msvcrt
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    create_file = kernel32.CreateFileW
-    create_file.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
-                            wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
-    create_file.restype = wintypes.HANDLE
-    handle = create_file(str(path), 0x40000000, 0, None, 1, 0x00200080, None)
-    if handle == wintypes.HANDLE(-1).value:
-        raise ctypes.WinError(ctypes.get_last_error())
-    try:
-        fd = msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY)
-    except Exception:
-        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
-        kernel32.CloseHandle.restype = wintypes.BOOL
-        kernel32.CloseHandle(handle)
-        raise
-    try:
-        return os.fdopen(fd, "w", encoding="utf-8")
-    except Exception:
-        os.close(fd)
-        raise
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
 
 
 def main(argv=None):
+    with ExitStack() as stack:
+        return run(argv, stack)
+
+
+def run(argv, stack):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scan", type=Path, action="append", required=True, help="Explicit model directory; repeatable")
     parser.add_argument("--visomaster", type=Path, help="Explicit installation directory, version hint only")
@@ -218,6 +258,10 @@ def main(argv=None):
         vm = None
     if vm and (destination == vm or vm in destination.parents or destination in vm.parents):
         parser.error("--output must be disjoint from VisoMaster directory")
+    try:
+        output_anchor = stack.enter_context(secure_io.anchor(destination, allow_missing=True))
+    except OSError as exc:
+        parser.error(f"output check failed ({type(exc).__name__})")
     output_json, output_md = destination / "inventory.json", destination / "inventory.md"
     for path in (output_json, output_md):
         try:
@@ -231,7 +275,10 @@ def main(argv=None):
     provenance = {}
     if args.provenance:
         with args.provenance.open(encoding="utf-8") as stream:
-            provenance = json.load(stream)
+            try:
+                provenance = json.load(stream, object_pairs_hook=unique_object)
+            except ValueError:
+                parser.error("--provenance contains duplicate JSON keys or invalid JSON")
         if not isinstance(provenance, dict) or any(not re.fullmatch(r"[a-fA-F0-9]{64}", k) or not isinstance(v, dict) for k, v in provenance.items()):
             parser.error("--provenance must map SHA-256 hashes to objects")
         if any(set(v) - {"source", "license", "note"} or
@@ -265,13 +312,12 @@ def main(argv=None):
     json_text = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
     markdown_text = report(data)
     try:
-        destination.mkdir(parents=True, exist_ok=True)
-        # Reserve both names exclusively before writing any inventory data.
-        # This also rejects links/files created after the preflight check.
-        with create_output(output_json) as json_stream, \
-                create_output(output_md) as markdown_stream:
-            json_stream.write(json_text)
-            markdown_stream.write(markdown_text)
+        with secure_io.materialize(*output_anchor) as directory:
+            # Reserve both names before writing any inventory data.
+            with directory.file("inventory.json", create=True) as json_stream, \
+                    directory.file("inventory.md", create=True) as markdown_stream:
+                json_stream.write(json_text)
+                markdown_stream.write(markdown_text)
     except OSError as exc:
         parser.error(f"output write failed ({type(exc).__name__}); use a fresh output directory")
     print(f"Inventoried {len(data['assets'])} files in {destination}")
@@ -279,3 +325,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
+
