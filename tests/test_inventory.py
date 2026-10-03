@@ -432,24 +432,37 @@ class InventoryTests(unittest.TestCase):
         outside = self.base / "outside"
         outside.mkdir()
         (outside / "external.engine").write_bytes(b"never read")
-        real_file = inventory.secure_io.Directory.file
-        swapped = False
+        real_child = inventory.secure_io.Directory.child
+        attempted, blocked = False, False
 
         @contextlib.contextmanager
-        def file(directory, name, create=False):
-            nonlocal swapped
-            if name == self.source.name and not swapped:
-                nested.rename(self.root / "original-nested")
-                self.make_symlink(nested, outside, directory=True)
-                swapped = True
-            with real_file(directory, name, create) as stream:
-                yield stream
+        def child(directory, name, create=False):
+            nonlocal attempted, blocked
+            if directory.path == self.root and name == "nested" and not attempted:
+                attempted = True
+                try:
+                    nested.rename(self.root / "original-nested")
+                except PermissionError as exc:
+                    # Windows may also deny a child rename through the pinned parent.
+                    self.assertEqual(os.name, "nt")
+                    self.assertIn(exc.winerror, (5, 32))
+                    blocked = True
+                else:
+                    self.make_symlink(nested, outside, directory=True)
+            with real_child(directory, name, create) as opened:
+                yield opened
 
-        with patch.object(inventory.secure_io.Directory, "file", file):
-            with self.assertRaises(SystemExit):
+        with patch.object(inventory.secure_io.Directory, "child", child):
+            try:
                 self.run_inventory()
-        self.assertTrue(swapped)
-        self.assertFalse(self.output.exists())
+            except SystemExit as exc:
+                self.assertEqual(exc.code, 2)
+                self.assertFalse(blocked)
+                self.assertFalse(self.output.exists())
+            else:
+                self.assertTrue(blocked, "a replaced queued directory must be rejected")
+                self.assertEqual([a["sha256"] for a in self.read_assets()], [self.sha256])
+        self.assertTrue(attempted)
         self.assertEqual((outside / "external.engine").read_bytes(), b"never read")
 
     def test_open_directory_swap_cannot_redirect_enumeration(self):
