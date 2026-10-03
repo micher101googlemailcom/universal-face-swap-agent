@@ -24,7 +24,9 @@ def windows_open(path, directory=False, create=False):
     kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
     kernel.CloseHandle.restype = wintypes.BOOL
     # Share read only: prevent rename/deletion and in-place reparse-point writes.
-    handle = kernel.CreateFileW(str(path), 0x80 if directory else (0x40000000 if create else 0x80000000),
+    # FILE_READ_ATTRIBUTES alone does not participate in share-access checking.
+    # Request GENERIC_READ for directories as well so deny-write/delete is enforced.
+    handle = kernel.CreateFileW(str(path), 0x40000000 if create else 0x80000000,
                                 1, None, 1 if create else 3,
                                 0x00200000 | (0x02000000 if directory else 0x80), None)
     if handle == wintypes.HANDLE(-1).value:
